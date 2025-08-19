@@ -1,0 +1,15 @@
+{
+    "name": "esp32-manager",
+    "version": "0.1.1",
+    "keywords": "ble, midi, bluetooth, wifi, esp32",
+    "description": "Provides standard functionality using an ESP32-S3 for Pirate MIDI devices",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/samspencer5991/buttons.git"
+    },
+    "frameworks": "arduino",
+    "platforms": "espressif32",
+    "build": {
+        "libArchive": false
+    }
+}
