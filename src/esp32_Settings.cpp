@@ -1,4 +1,4 @@
-#include "esp32_Settings.h"
+#include "esp32_settings.h"
 #include <LittleFS.h>
 
 #define FORMAT_LITTLEFS_IF_FAILED true
