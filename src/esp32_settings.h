@@ -1,7 +1,12 @@
 #ifndef ESP32_SETTINGS_H
 #define ESP32_SETTINGS_H
-#include <Arduino.h>
-#include "stdlib.h"
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define DEVICE_FIRST_BOOT_VALUE 100
 #define DEVICE_CONFIGURED_VALUE 114 // Arbitrary value to indicate the device has been configured
@@ -20,5 +25,9 @@ void esp32Settings_ReadGlobalSettings();
 void esp32Settings_SaveGlobalSettings();
 void esp32Settings_ReadPresets();
 void esp32Settings_SavePresets();
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // ESP32_SETTINGS_H
