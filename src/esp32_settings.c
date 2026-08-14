@@ -107,7 +107,11 @@ static bool esp32Settings_WriteBlob(const char *path, const char *tmp_path,
 	fclose(f); // commits the temp file to flash
 
 	if (!ok) {
-		ESP_LOGE(TAG, "Short write to %s (expected %u payload bytes)", tmp_path, (unsigned)len);
+		// A short write here is almost always heap exhaustion in the caller, not a full
+		// filesystem: the littlefs write needs a ~4 KB block, so if free internal heap is
+		// starved (e.g. a large ArduinoJson doc still alive) the first fwrite returns 0.
+		// Callers must release transient buffers before saving. See docs/SOLUTIONS.md.
+		ESP_LOGE(TAG, "Short write to %s (expected %u payload bytes) — low heap?", tmp_path, (unsigned)len);
 		remove(tmp_path);
 		return false;
 	}
