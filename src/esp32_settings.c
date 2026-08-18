@@ -24,6 +24,8 @@
 #define SETTINGS_BASE_PATH         "/lfs"
 #define GLOBAL_PATH                SETTINGS_BASE_PATH "/global.txt"
 #define GLOBAL_TMP_PATH            SETTINGS_BASE_PATH "/global.tmp"
+#define BANKS_PATH                 SETTINGS_BASE_PATH "/banks.txt"
+#define BANKS_TMP_PATH             SETTINGS_BASE_PATH "/banks.tmp"
 #define PRESETS_PATH               SETTINGS_BASE_PATH "/presets.txt"
 #define PRESETS_TMP_PATH           SETTINGS_BASE_PATH "/presets.tmp"
 
@@ -47,14 +49,18 @@ typedef struct __attribute__((packed)) {
 static const char *TAG = "ESP32_SETTINGS";
 
 void* globalSettingsPtr = NULL;
+void* banksPtr = NULL;
 void* presetsPtr = NULL;
 uint8_t* bootFlagPtr = NULL;
+size_t numBanks = 0;
 size_t numPresets = 0;
 
 uint16_t globalSettingsSize = 0;
+uint16_t bankSize = 0;
 uint16_t presetSize = 0;
 
 void (*assignDefaultGlobalSettings)() = NULL;
+void (*assignDefaultBankSettings)() = NULL;
 void (*assignDefaultPresetSettings)() = NULL;
 
 static void esp32Settings_ListDir(const char *dirname, uint8_t levels);
@@ -150,28 +156,43 @@ static bool esp32Settings_ReadBlob(const char *path, void *data, size_t len)
 	return ok;
 }
 
-// Checks for the standard combination of a global settings file and a presets file.
-// If either is missing or fails validation, the device is reconfigured to defaults.
-// Also initialises the global/preset pointers and the number of presets. The bootflag
-// is a pointer into the global settings struct (its stored boot-state byte).
-uint8_t esp32Settings_BootCheck(	void* globalSettings, uint16_t gSize, void* presets,
-										uint16_t pSize, size_t num, uint8_t* bootFlag)
+// Checks for the standard combination of a global settings file plus optional bank
+// and preset files. If any used file is missing or fails validation, the device is
+// reconfigured to defaults. Also initialises the global/bank/preset pointers and their
+// element counts. The bootflag is a pointer into the global settings struct (its stored
+// boot-state byte).
+//
+// `banks` and/or `presets` may be passed as NULL: a NULL element is ignored entirely —
+// no size validation, existence check, load or save is performed for it. `globalSettings`
+// and `bootFlag` are always required.
+uint8_t esp32Settings_BootCheck(	void* globalSettings, uint16_t gSize,
+										void* banks, uint16_t bSize, size_t numBank,
+										void* presets, uint16_t pSize, size_t numPreset,
+										uint8_t* bootFlag)
 {
 	uint8_t bootFlagValue = 0;
-	ESP_LOGI(TAG, "Preset size %d", pSize);
+	ESP_LOGI(TAG, "Bank size %d, Preset size %d", bSize, pSize);
 	ESP_LOGI(TAG, "Boot check initiated.");
-	if (globalSettings == NULL || presets == NULL || num == 0 || bootFlag == NULL) {
-		ESP_LOGE(TAG, "Invalid settings or presets pointers.");
+	if (globalSettings == NULL || bootFlag == NULL) {
+		ESP_LOGE(TAG, "Invalid global settings or boot flag pointer.");
 		return 0;
 	}
 
-	// Assign the global settings and presets pointers
+	// Assign the global/bank/preset pointers (banks/presets may be NULL = unused)
 	globalSettingsPtr = globalSettings;
+	banksPtr = banks;
 	presetsPtr = presets;
 	bootFlagPtr = bootFlag;
-	numPresets = num;
+	numBanks = numBank;
+	numPresets = numPreset;
 	globalSettingsSize = gSize;
+	bankSize = bSize;
 	presetSize = pSize;
+
+	if (banksPtr == NULL)
+		ESP_LOGI(TAG, "Banks not used (NULL) — skipping.");
+	if (presetsPtr == NULL)
+		ESP_LOGI(TAG, "Presets not used (NULL) — skipping.");
 
 	// Mount the filesystem (formats a blank/corrupt partition automatically).
 	ESP_LOGI(TAG, "Mounting storage...");
@@ -182,13 +203,20 @@ uint8_t esp32Settings_BootCheck(	void* globalSettings, uint16_t gSize, void* pre
 		esp32Settings_NewDeviceConfig();
 	}
 
-	// Validate + load both files. A missing/corrupt file triggers reconfiguration
-	// (which formats, writes defaults, and reboots — so it does not return).
+	// Validate + load the used files. A missing/corrupt file triggers reconfiguration
+	// (which formats, writes defaults, and reboots — so it does not return). NULL
+	// (unused) elements validate as OK without touching storage.
 	ESP_LOGI(TAG, "Validating stored settings...");
 	bool globalOk  = esp32Settings_ReadBlob(GLOBAL_PATH, globalSettingsPtr, globalSettingsSize);
-	bool presetsOk = globalOk && esp32Settings_ReadBlob(PRESETS_PATH, presetsPtr,
+	bool banksOk   = true;
+	if (banksPtr != NULL)
+		banksOk = globalOk && esp32Settings_ReadBlob(BANKS_PATH, banksPtr,
+													 (size_t)bankSize * numBanks);
+	bool presetsOk = true;
+	if (presetsPtr != NULL)
+		presetsOk = globalOk && esp32Settings_ReadBlob(PRESETS_PATH, presetsPtr,
 													    (size_t)presetSize * numPresets);
-	if (!globalOk || !presetsOk) {
+	if (!globalOk || !banksOk || !presetsOk) {
 		ESP_LOGI(TAG, "Stored settings missing/invalid — reconfiguring.");
 		esp32Settings_NewDeviceConfig();
 	}
@@ -229,13 +257,29 @@ void esp32Settings_NewDeviceConfig()
 
 	ESP_LOGI(TAG, "Boot flag = %d", *bootFlagPtr);
 
-	// Configure default preset values
-	if (assignDefaultPresetSettings != NULL)
-		assignDefaultPresetSettings();
-	else
-		ESP_LOGE(TAG, "No default preset settings function assigned. Pointer is null.");
+	// Configure default bank values (skipped when banks are unused)
+	if (banksPtr == NULL) {
+		ESP_LOGI(TAG, "Banks not used (NULL) — skipping default bank config.");
+	} else if (assignDefaultBankSettings != NULL) {
+		assignDefaultBankSettings();
+	} else {
+		ESP_LOGE(TAG, "No default bank settings function assigned. Pointer is null.");
+	}
 
-	// Create the presets storage file
+	// Create the banks storage file (self-skips when unused)
+	ESP_LOGI(TAG, "Creating banks file...");
+	esp32Settings_SaveBanks();
+
+	// Configure default preset values (skipped when presets are unused)
+	if (presetsPtr == NULL) {
+		ESP_LOGI(TAG, "Presets not used (NULL) — skipping default preset config.");
+	} else if (assignDefaultPresetSettings != NULL) {
+		assignDefaultPresetSettings();
+	} else {
+		ESP_LOGE(TAG, "No default preset settings function assigned. Pointer is null.");
+	}
+
+	// Create the presets storage file (self-skips when unused)
 	ESP_LOGI(TAG, "Creating presets file...");
 	esp32Settings_SavePresets();
 
@@ -247,8 +291,9 @@ void esp32Settings_NewDeviceConfig()
 
 void esp32Settings_StandardBoot()
 {
-	// Re-read the persisted data into the struct pointers
+	// Re-read the persisted data into the struct pointers (bank/preset self-skip if unused)
 	esp32Settings_ReadGlobalSettings();
+	esp32Settings_ReadBanks();
 	esp32Settings_ReadPresets();
 
 	ESP_LOGI(TAG, "Standard boot complete!");
@@ -266,6 +311,14 @@ void esp32Settings_AssignDefaultGlobalSettings(void (*fptr)())
 		assignDefaultGlobalSettings = fptr;
 	else
 		ESP_LOGE(TAG, "No default global settings function assigned. Pointer is null.");
+}
+
+void esp32Settings_AssignDefaultBankSettings(void (*fptr)())
+{
+	if (fptr != NULL)
+		assignDefaultBankSettings = fptr;
+	else
+		ESP_LOGE(TAG, "No default bank settings function assigned. Pointer is null.");
 }
 
 void esp32Settings_AssignDefaultPresetSettings(void (*fptr)())
@@ -302,8 +355,34 @@ void esp32Settings_SaveGlobalSettings()
 	esp32Settings_WriteBlob(GLOBAL_PATH, GLOBAL_TMP_PATH, globalSettingsPtr, globalSettingsSize);
 }
 
+void esp32Settings_ReadBanks()
+{
+	if (banksPtr == NULL) {
+		ESP_LOGI(TAG, "Banks not used (NULL) — skipping read.");
+		return;
+	}
+	ESP_LOGI(TAG, "Reading banks...");
+	if (!esp32Settings_ReadBlob(BANKS_PATH, banksPtr, (size_t)bankSize * numBanks))
+		ESP_LOGE(TAG, "Banks read failed.");
+}
+
+void esp32Settings_SaveBanks()
+{
+	if (banksPtr == NULL) {
+		ESP_LOGI(TAG, "Banks not used (NULL) — skipping save.");
+		return;
+	}
+	ESP_LOGI(TAG, "Saving banks to file.");
+	esp32Settings_WriteBlob(BANKS_PATH, BANKS_TMP_PATH, banksPtr,
+							(size_t)bankSize * numBanks);
+}
+
 void esp32Settings_ReadPresets()
 {
+	if (presetsPtr == NULL) {
+		ESP_LOGI(TAG, "Presets not used (NULL) — skipping read.");
+		return;
+	}
 	ESP_LOGI(TAG, "Reading presets...");
 	if (!esp32Settings_ReadBlob(PRESETS_PATH, presetsPtr, (size_t)presetSize * numPresets))
 		ESP_LOGE(TAG, "Presets read failed.");
@@ -311,6 +390,10 @@ void esp32Settings_ReadPresets()
 
 void esp32Settings_SavePresets()
 {
+	if (presetsPtr == NULL) {
+		ESP_LOGI(TAG, "Presets not used (NULL) — skipping save.");
+		return;
+	}
 	ESP_LOGI(TAG, "Saving presets to file.");
 	esp32Settings_WriteBlob(PRESETS_PATH, PRESETS_TMP_PATH, presetsPtr,
 							(size_t)presetSize * numPresets);
