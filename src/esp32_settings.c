@@ -1,4 +1,5 @@
 #include "esp32_settings.h"
+#include "esp32_settings_tlv.h"   // shared on-disk header + TLV codec
 
 #include <stdio.h>
 #include <string.h>
@@ -35,16 +36,9 @@
 // + exact length + CRC32 of the payload — a corrupt or truncated file (e.g. a
 // power loss mid-write) is detected and the caller falls back to defaults, rather
 // than the old size-only check which a half-written file of the right length passed.
-#define SETTINGS_MAGIC     0x53455454u // 'SETT'
+// The header struct + SETTINGS_MAGIC now live in esp32_settings_tlv.h (shared with
+// the tagged path). Version 1 = raw struct blob (this legacy path); version 2 = TLV.
 #define SETTINGS_VERSION   1
-
-typedef struct __attribute__((packed)) {
-	uint32_t magic;
-	uint16_t version;
-	uint16_t reserved;  // keeps the payload 4-byte aligned in the file
-	uint32_t length;    // payload length in bytes
-	uint32_t crc32;     // esp_rom_crc32_le(0, payload, length)
-} settings_header_t;
 
 static const char *TAG = "ESP32_SETTINGS";
 
@@ -62,6 +56,16 @@ uint16_t presetSize = 0;
 void (*assignDefaultGlobalSettings)() = NULL;
 void (*assignDefaultBankSettings)() = NULL;
 void (*assignDefaultPresetSettings)() = NULL;
+
+// Tagged (TLV) mode. When BootCheckTagged wires these up, the global/preset
+// Save*/Read* helpers persist via the forward-compatible TLV codec instead of
+// the raw struct blob; banks remain raw-only. See esp32_settings_tlv.h.
+static bool                    tlvMode = false;
+static settings_serialize_fn   tlvGlobalSerialize   = NULL;
+static settings_deserialize_fn tlvGlobalDeserialize = NULL;
+static settings_serialize_fn   tlvPresetSerialize   = NULL;
+static settings_deserialize_fn tlvPresetDeserialize = NULL;
+static void                   *tlvCtx = NULL;
 
 static void esp32Settings_ListDir(const char *dirname, uint8_t levels);
 
@@ -165,7 +169,7 @@ static bool esp32Settings_ReadBlob(const char *path, void *data, size_t len)
 // `banks` and/or `presets` may be passed as NULL: a NULL element is ignored entirely —
 // no size validation, existence check, load or save is performed for it. `globalSettings`
 // and `bootFlag` are always required.
-uint8_t esp32Settings_BootCheck(	void* globalSettings, uint16_t gSize,
+uint8_t esp32Settings_BootCheck(	void* globalStore, uint16_t gSize,
 										void* banks, uint16_t bSize, size_t numBank,
 										void* presets, uint16_t pSize, size_t numPreset,
 										uint8_t* bootFlag)
@@ -173,13 +177,13 @@ uint8_t esp32Settings_BootCheck(	void* globalSettings, uint16_t gSize,
 	uint8_t bootFlagValue = 0;
 	ESP_LOGI(TAG, "Bank size %d, Preset size %d", bSize, pSize);
 	ESP_LOGI(TAG, "Boot check initiated.");
-	if (globalSettings == NULL || bootFlag == NULL) {
+	if (globalStore == NULL || bootFlag == NULL) {
 		ESP_LOGE(TAG, "Invalid global settings or boot flag pointer.");
 		return 0;
 	}
 
 	// Assign the global/bank/preset pointers (banks/presets may be NULL = unused)
-	globalSettingsPtr = globalSettings;
+	globalSettingsPtr = globalStore;
 	banksPtr = banks;
 	presetsPtr = presets;
 	bootFlagPtr = bootFlag;
@@ -229,6 +233,79 @@ uint8_t esp32Settings_BootCheck(	void* globalSettings, uint16_t gSize,
 	} else {
 		ESP_LOGI(TAG, "Performing standard boot...");
 		esp32Settings_StandardBoot();
+	}
+	return bootFlagValue;
+}
+
+// Tagged (TLV) boot check — forward-compatible variant of esp32Settings_BootCheck.
+//
+// Instead of validating a raw struct blob by exact length, it decodes a tagged
+// stream via the caller's (de)serialise callbacks: adding / removing / reordering
+// a field never wipes user settings (see docs/settings-migration-plan.md). Only a
+// missing file, a non-TLV/wrong-version header (e.g. a legacy raw v1 blob — the
+// one intended wipe at cutover), or a CRC mismatch routes to a factory reconfigure.
+//
+// The caller MUST have already registered the default-assignment callbacks
+// (esp32Settings_AssignDefault*). Defaults are applied *before* each decode so any
+// tag missing from an older file keeps its chosen default. Banks are not supported
+// in tagged mode (pass presets only); `presets`/its callbacks may be NULL.
+uint8_t esp32Settings_BootCheckTagged(
+		void *globalStore, settings_serialize_fn gSerialize, settings_deserialize_fn gDeserialize,
+		void *presets, settings_serialize_fn pSerialize, settings_deserialize_fn pDeserialize,
+		uint8_t *bootFlag, void *ctx)
+{
+	ESP_LOGI(TAG, "Tagged boot check initiated.");
+	if (globalStore == NULL || bootFlag == NULL ||
+	    gSerialize == NULL || gDeserialize == NULL) {
+		ESP_LOGE(TAG, "Invalid global settings/boot flag/callback pointer.");
+		return 0;
+	}
+
+	globalSettingsPtr = globalStore;
+	presetsPtr        = presets;
+	banksPtr          = NULL;   // banks are raw-only; unused in tagged mode
+	bootFlagPtr       = bootFlag;
+
+	tlvMode              = true;
+	tlvGlobalSerialize   = gSerialize;
+	tlvGlobalDeserialize = gDeserialize;
+	tlvPresetSerialize   = pSerialize;
+	tlvPresetDeserialize = pDeserialize;
+	tlvCtx               = ctx;
+
+	ESP_LOGI(TAG, "Mounting storage...");
+	if (!esp32Settings_Mount())
+		esp32Settings_NewDeviceConfig();  // no filesystem — format + defaults + reboot
+
+	// Pre-fill defaults so any tag absent from an older file keeps its default,
+	// then decode the stored tags over the top.
+	ESP_LOGI(TAG, "Validating stored settings (tagged)...");
+	if (assignDefaultGlobalSettings != NULL)
+		assignDefaultGlobalSettings();
+	settings_tlv_status_t gStatus = esp32SettingsTlv_LoadFile(GLOBAL_PATH, gDeserialize, ctx);
+
+	settings_tlv_status_t pStatus = SETTINGS_TLV_OK;
+	if (presetsPtr != NULL && pDeserialize != NULL) {
+		if (assignDefaultPresetSettings != NULL)
+			assignDefaultPresetSettings();
+		pStatus = esp32SettingsTlv_LoadFile(PRESETS_PATH, pDeserialize, ctx);
+	}
+
+	// A decodable payload (OK) is kept even if some tags were missing/defaulted.
+	// Anything else — missing file, non-TLV header, or corruption — reconfigures.
+	if (gStatus != SETTINGS_TLV_OK || pStatus != SETTINGS_TLV_OK) {
+		ESP_LOGI(TAG, "Stored settings missing/invalid (global=%d, presets=%d) — reconfiguring.",
+		         (int)gStatus, (int)pStatus);
+		esp32Settings_NewDeviceConfig();
+	}
+
+	uint8_t bootFlagValue = *bootFlagPtr;
+	if (*bootFlagPtr != DEVICE_CONFIGURED_VALUE) {
+		ESP_LOGI(TAG, "Configuring new device...");
+		esp32Settings_NewDeviceConfig();
+	} else {
+		ESP_LOGI(TAG, "Tagged standard boot complete.");
+		esp32Settings_ListDir(SETTINGS_BASE_PATH, 1);
 	}
 	return bootFlagValue;
 }
@@ -345,6 +422,13 @@ void esp32Settings_ResetAllSettings()
 void esp32Settings_ReadGlobalSettings()
 {
 	ESP_LOGI(TAG, "Reading global settings...");
+	if (tlvMode) {
+		if (assignDefaultGlobalSettings != NULL)
+			assignDefaultGlobalSettings();  // defaults under any tags absent from the file
+		if (esp32SettingsTlv_LoadFile(GLOBAL_PATH, tlvGlobalDeserialize, tlvCtx) != SETTINGS_TLV_OK)
+			ESP_LOGE(TAG, "Global settings (TLV) read failed.");
+		return;
+	}
 	if (!esp32Settings_ReadBlob(GLOBAL_PATH, globalSettingsPtr, globalSettingsSize))
 		ESP_LOGE(TAG, "Global settings read failed.");
 }
@@ -352,6 +436,11 @@ void esp32Settings_ReadGlobalSettings()
 void esp32Settings_SaveGlobalSettings()
 {
 	ESP_LOGI(TAG, "Saving global settings to file.");
+	if (tlvMode) {
+		if (!esp32SettingsTlv_SaveFile(GLOBAL_PATH, GLOBAL_TMP_PATH, tlvGlobalSerialize, tlvCtx))
+			ESP_LOGE(TAG, "Global settings (TLV) save failed.");
+		return;
+	}
 	esp32Settings_WriteBlob(GLOBAL_PATH, GLOBAL_TMP_PATH, globalSettingsPtr, globalSettingsSize);
 }
 
@@ -384,6 +473,17 @@ void esp32Settings_ReadPresets()
 		return;
 	}
 	ESP_LOGI(TAG, "Reading presets...");
+	if (tlvMode) {
+		if (tlvPresetDeserialize == NULL) {
+			ESP_LOGE(TAG, "No preset deserialiser in tagged mode.");
+			return;
+		}
+		if (assignDefaultPresetSettings != NULL)
+			assignDefaultPresetSettings();
+		if (esp32SettingsTlv_LoadFile(PRESETS_PATH, tlvPresetDeserialize, tlvCtx) != SETTINGS_TLV_OK)
+			ESP_LOGE(TAG, "Presets (TLV) read failed.");
+		return;
+	}
 	if (!esp32Settings_ReadBlob(PRESETS_PATH, presetsPtr, (size_t)presetSize * numPresets))
 		ESP_LOGE(TAG, "Presets read failed.");
 }
@@ -395,6 +495,15 @@ void esp32Settings_SavePresets()
 		return;
 	}
 	ESP_LOGI(TAG, "Saving presets to file.");
+	if (tlvMode) {
+		if (tlvPresetSerialize == NULL) {
+			ESP_LOGE(TAG, "No preset serialiser in tagged mode.");
+			return;
+		}
+		if (!esp32SettingsTlv_SaveFile(PRESETS_PATH, PRESETS_TMP_PATH, tlvPresetSerialize, tlvCtx))
+			ESP_LOGE(TAG, "Presets (TLV) save failed.");
+		return;
+	}
 	esp32Settings_WriteBlob(PRESETS_PATH, PRESETS_TMP_PATH, presetsPtr,
 							(size_t)presetSize * numPresets);
 }
