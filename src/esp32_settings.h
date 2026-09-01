@@ -34,6 +34,27 @@ uint8_t esp32Settings_BootCheckTagged(
 		void* globalStore, settings_serialize_fn gSerialize, settings_deserialize_fn gDeserialize,
 		void* presets, settings_serialize_fn pSerialize, settings_deserialize_fn pDeserialize,
 		uint8_t* bootFlag, void* ctx);
+
+// Phased tagged boot check. Splits esp32Settings_BootCheckTagged so early-boot code can
+// run between the two halves. Phase 1 (Begin) mounts storage and loads the global settings
+// only — so the caller can read e.g. display rotation and bring up a boot screen BEFORE the
+// slower preset load or any factory reconfigure. Phase 2 (Finish) loads presets and performs
+// the reconfigure decision (which may format the filesystem and reboot). Call order:
+//   esp32Settings_BootBeginTagged(...);  // global valid after this
+//   ...early work (display, etc.)...
+//   esp32Settings_BootFinishTagged();
+// Same argument contract as esp32Settings_BootCheckTagged, which is now a Begin+Finish wrapper.
+void esp32Settings_BootBeginTagged(
+		void* globalStore, settings_serialize_fn gSerialize, settings_deserialize_fn gDeserialize,
+		void* presets, settings_serialize_fn pSerialize, settings_deserialize_fn pDeserialize,
+		uint8_t* bootFlag, void* ctx);
+uint8_t esp32Settings_BootFinishTagged(void);
+
+// Optional hook invoked once, immediately before a factory reconfigure formats the
+// filesystem (from esp32Settings_NewDeviceConfig). Lets the app surface a "resetting"
+// message on an already-visible display before the blocking format. NULL = no callback.
+void esp32Settings_SetFactoryResetNotify(void (*cb)(void));
+
 void esp32Settings_NewDeviceConfig();
 void esp32Settings_StandardBoot();
 void esp32Settings_SoftwareReset();

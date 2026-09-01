@@ -67,6 +67,14 @@ static settings_serialize_fn   tlvPresetSerialize   = NULL;
 static settings_deserialize_fn tlvPresetDeserialize = NULL;
 static void                   *tlvCtx = NULL;
 
+// Phased boot-check state, carried between BootBeginTagged and BootFinishTagged.
+static bool                    tlvBeginOk      = false;   // Begin ran and pointers were valid
+static bool                    tlvMounted      = false;   // storage mounted in Begin
+static settings_tlv_status_t   tlvGlobalStatus = SETTINGS_TLV_OK;  // global-load result from Begin
+
+// Optional "about to factory reset" notification (see esp32Settings_SetFactoryResetNotify).
+static void (*factoryResetNotify)(void) = NULL;
+
 static void esp32Settings_ListDir(const char *dirname, uint8_t levels);
 
 // Mount the storage partition. Returns true if mounted (or already mounted).
@@ -249,16 +257,20 @@ uint8_t esp32Settings_BootCheck(	void* globalStore, uint16_t gSize,
 // (esp32Settings_AssignDefault*). Defaults are applied *before* each decode so any
 // tag missing from an older file keeps its chosen default. Banks are not supported
 // in tagged mode (pass presets only); `presets`/its callbacks may be NULL.
-uint8_t esp32Settings_BootCheckTagged(
+// Phase 1: mount storage + load global settings. See esp32_settings.h for the phased
+// contract. After this returns, globalStore holds the stored (or defaulted) global values,
+// so early-boot code (e.g. display rotation) can run before the slower Phase 2.
+void esp32Settings_BootBeginTagged(
 		void *globalStore, settings_serialize_fn gSerialize, settings_deserialize_fn gDeserialize,
 		void *presets, settings_serialize_fn pSerialize, settings_deserialize_fn pDeserialize,
 		uint8_t *bootFlag, void *ctx)
 {
-	ESP_LOGI(TAG, "Tagged boot check initiated.");
+	ESP_LOGI(TAG, "Tagged boot check (phase 1: mount + global).");
 	if (globalStore == NULL || bootFlag == NULL ||
 	    gSerialize == NULL || gDeserialize == NULL) {
 		ESP_LOGE(TAG, "Invalid global settings/boot flag/callback pointer.");
-		return 0;
+		tlvBeginOk = false;
+		return;
 	}
 
 	globalSettingsPtr = globalStore;
@@ -272,30 +284,48 @@ uint8_t esp32Settings_BootCheckTagged(
 	tlvPresetSerialize   = pSerialize;
 	tlvPresetDeserialize = pDeserialize;
 	tlvCtx               = ctx;
+	tlvBeginOk           = true;
 
 	ESP_LOGI(TAG, "Mounting storage...");
-	if (!esp32Settings_Mount())
-		esp32Settings_NewDeviceConfig();  // no filesystem — format + defaults + reboot
+	tlvMounted = esp32Settings_Mount();
 
-	// Pre-fill defaults so any tag absent from an older file keeps its default,
-	// then decode the stored tags over the top.
-	ESP_LOGI(TAG, "Validating stored settings (tagged)...");
+	// Pre-fill defaults so any tag absent from an older file keeps its default, then decode
+	// the stored global tags over the top. Deferred: if the mount failed (or the file is
+	// missing/corrupt), Phase 2 routes to NewDeviceConfig — we do NOT reconfigure here, so
+	// the caller can bring up the display first and show the reset message during the format.
 	if (assignDefaultGlobalSettings != NULL)
 		assignDefaultGlobalSettings();
-	settings_tlv_status_t gStatus = esp32SettingsTlv_LoadFile(GLOBAL_PATH, gDeserialize, ctx);
+	if (tlvMounted) {
+		ESP_LOGI(TAG, "Validating stored global settings (tagged)...");
+		tlvGlobalStatus = esp32SettingsTlv_LoadFile(GLOBAL_PATH, gDeserialize, ctx);
+	} else {
+		ESP_LOGE(TAG, "Storage not mounted — deferring reconfigure to phase 2.");
+		tlvGlobalStatus = SETTINGS_TLV_MISSING;   // forces reconfigure in Finish
+	}
+}
+
+// Phase 2: load presets + run the reconfigure decision. May format the filesystem and
+// reboot (esp32Settings_NewDeviceConfig). Returns the boot flag value as read from storage.
+uint8_t esp32Settings_BootFinishTagged(void)
+{
+	ESP_LOGI(TAG, "Tagged boot check (phase 2: presets + reconfigure).");
+	if (!tlvBeginOk || bootFlagPtr == NULL) {
+		ESP_LOGE(TAG, "BootFinishTagged called without a successful BootBeginTagged.");
+		return 0;
+	}
 
 	settings_tlv_status_t pStatus = SETTINGS_TLV_OK;
-	if (presetsPtr != NULL && pDeserialize != NULL) {
+	if (tlvMounted && presetsPtr != NULL && tlvPresetDeserialize != NULL) {
 		if (assignDefaultPresetSettings != NULL)
 			assignDefaultPresetSettings();
-		pStatus = esp32SettingsTlv_LoadFile(PRESETS_PATH, pDeserialize, ctx);
+		pStatus = esp32SettingsTlv_LoadFile(PRESETS_PATH, tlvPresetDeserialize, tlvCtx);
 	}
 
 	// A decodable payload (OK) is kept even if some tags were missing/defaulted.
-	// Anything else — missing file, non-TLV header, or corruption — reconfigures.
-	if (gStatus != SETTINGS_TLV_OK || pStatus != SETTINGS_TLV_OK) {
+	// Anything else — not mounted, missing file, non-TLV header, or corruption — reconfigures.
+	if (tlvGlobalStatus != SETTINGS_TLV_OK || pStatus != SETTINGS_TLV_OK) {
 		ESP_LOGI(TAG, "Stored settings missing/invalid (global=%d, presets=%d) — reconfiguring.",
-		         (int)gStatus, (int)pStatus);
+		         (int)tlvGlobalStatus, (int)pStatus);
 		esp32Settings_NewDeviceConfig();
 	}
 
@@ -310,9 +340,30 @@ uint8_t esp32Settings_BootCheckTagged(
 	return bootFlagValue;
 }
 
+// Backward-compatible single-call boot check: Begin immediately followed by Finish.
+uint8_t esp32Settings_BootCheckTagged(
+		void *globalStore, settings_serialize_fn gSerialize, settings_deserialize_fn gDeserialize,
+		void *presets, settings_serialize_fn pSerialize, settings_deserialize_fn pDeserialize,
+		uint8_t *bootFlag, void *ctx)
+{
+	esp32Settings_BootBeginTagged(globalStore, gSerialize, gDeserialize,
+	                              presets, pSerialize, pDeserialize, bootFlag, ctx);
+	return esp32Settings_BootFinishTagged();
+}
+
+void esp32Settings_SetFactoryResetNotify(void (*cb)(void))
+{
+	factoryResetNotify = cb;
+}
+
 // Configures the device to a factory state
 void esp32Settings_NewDeviceConfig()
 {
+	// Surface the reset on the display (if a hook is registered) before the blocking
+	// format below — the callback is expected to render a message and return promptly.
+	if (factoryResetNotify != NULL)
+		factoryResetNotify();
+
 	// Configure default values for global settings
 	if (assignDefaultGlobalSettings != NULL)
 		assignDefaultGlobalSettings();
