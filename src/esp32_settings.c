@@ -457,16 +457,23 @@ void esp32Settings_AssignDefaultPresetSettings(void (*fptr)())
 		ESP_LOGE(TAG, "No default preset settings function assigned. Pointer is null.");
 }
 
-// Invalidate the stored config so the next boot reconfigures to defaults. We write
-// the in-RAM global blob with a cleared boot flag: on reboot the file validates but
-// its boot flag != CONFIGURED, so BootCheck reconfigures.
+// Invalidate the stored config so the next boot reconfigures to defaults, by DELETING
+// the global settings file (works for both the raw and tagged paths — a missing global
+// file routes BootCheck/BootFinishTagged to esp32Settings_NewDeviceConfig, which formats
+// and rewrites defaults at early boot where heap is plentiful).
+//
+// We deliberately do NOT rewrite the file with a cleared boot flag: that full serialize is
+// heap-hungry, and running from the Device-API task with BLE/USB/LVGL up on the no-PSRAM N8
+// it was starving the littlefs write ("Failed to reserve header"), silently leaving the old
+// CONFIGURED file in place so the factory reset did nothing. remove() needs almost no heap.
 void esp32Settings_ResetAllSettings()
 {
-	ESP_LOGI(TAG, "Writing reset bootstate.");
-	if (bootFlagPtr != NULL)
-		*bootFlagPtr = 0;
-	esp32Settings_SaveGlobalSettings();
-	vTaskDelay(pdMS_TO_TICKS(1));
+	ESP_LOGI(TAG, "Factory reset: deleting %s to force reconfigure on next boot.", GLOBAL_PATH);
+	if (remove(GLOBAL_PATH) != 0)
+		ESP_LOGW(TAG, "Could not delete %s (may already be absent) - reconfigure still expected.", GLOBAL_PATH);
+	// littlefs commits the unlink synchronously, so no settle is needed for durability;
+	// the short delay just lets the UART log flush before the hard restart.
+	vTaskDelay(pdMS_TO_TICKS(50));
 	esp32Settings_SoftwareReset();
 }
 
