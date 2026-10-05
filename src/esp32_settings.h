@@ -12,6 +12,12 @@ extern "C" {
 
 #define DEVICE_FIRST_BOOT_VALUE 100
 #define DEVICE_CONFIGURED_VALUE 114 // Arbitrary value to indicate the device has been configured
+// Written by esp32Settings_NewDeviceConfig() instead of DEVICE_CONFIGURED_VALUE: "configured,
+// but this is the first boot since a reconfigure". Both boot checks accept it as configured.
+// The app may promote it to DEVICE_CONFIGURED_VALUE (and save) once it has seen whatever
+// triggered the reset go away — Scribble uses it to fire its switch-1 hold-at-boot factory
+// reset exactly once per hold, no matter how long the switch stays down.
+#define DEVICE_FRESH_RESET_VALUE 115
 
 // `banks` and/or `presets` may be NULL to indicate that storage element is unused:
 // it is then ignored entirely (no size validation, existence check, load or save).

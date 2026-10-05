@@ -235,7 +235,7 @@ uint8_t esp32Settings_BootCheck(	void* globalStore, uint16_t gSize,
 
 	// Both files loaded into the struct pointers; the boot flag now reflects storage.
 	bootFlagValue = *bootFlagPtr;
-	if (*bootFlagPtr != DEVICE_CONFIGURED_VALUE) {
+	if (*bootFlagPtr != DEVICE_CONFIGURED_VALUE && *bootFlagPtr != DEVICE_FRESH_RESET_VALUE) {
 		ESP_LOGI(TAG, "Configuring new device...");
 		esp32Settings_NewDeviceConfig();
 	} else {
@@ -330,7 +330,7 @@ uint8_t esp32Settings_BootFinishTagged(void)
 	}
 
 	uint8_t bootFlagValue = *bootFlagPtr;
-	if (*bootFlagPtr != DEVICE_CONFIGURED_VALUE) {
+	if (*bootFlagPtr != DEVICE_CONFIGURED_VALUE && *bootFlagPtr != DEVICE_FRESH_RESET_VALUE) {
 		ESP_LOGI(TAG, "Configuring new device...");
 		esp32Settings_NewDeviceConfig();
 	} else {
@@ -370,8 +370,10 @@ void esp32Settings_NewDeviceConfig()
 	else
 		ESP_LOGE(TAG, "No default global settings function assigned. Pointer is null.");
 
-	// Set the boot flag to indicate the device has been configured
-	*bootFlagPtr = DEVICE_CONFIGURED_VALUE;
+	// Set the boot flag to indicate the device has been configured. FRESH (not CONFIGURED) so
+	// the app can tell "first boot since a reconfigure" apart from a normal boot; both are
+	// accepted as configured by the boot checks, and the app promotes it when it chooses.
+	*bootFlagPtr = DEVICE_FRESH_RESET_VALUE;
 
 	// Format the file system to revert to a clean state
 	ESP_LOGI(TAG, "Formatting file system...");
